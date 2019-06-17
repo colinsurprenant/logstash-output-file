@@ -78,6 +78,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   config :rotate_interval, :validate => :number, :default => 60 # minutes
   config :rotate_size, :validate => :number, :default => 100 # mb
   config :rotate_idle, :validate => :number, :default => 3600 # seconds
+  config :rotate_extension, :validate => :string, :default => ".tmp"
 
 
   default :codec, "json_lines"
@@ -111,9 +112,9 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   end
 
   def multi_receive_encoded(events_and_encoded)
-    encoded_by_path = Hash.new {|h,k| h[k] = []}
+    encoded_by_path = Hash.new { |h, k| h[k] = [] }
 
-    events_and_encoded.each do |event,encoded|
+    events_and_encoded.each do |event, encoded|
       file_output_path = event_path(event)
       encoded_by_path[file_output_path] << encoded
     end
@@ -130,12 +131,12 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   def close
     @flusher.stop unless @flusher.nil?
     @io_mutex.synchronize do
-      @logger.debug("Close: closing files")
+      @logger.debug? &&  @logger.debug("Close: closing files")
 
       @files.each do |path, fd|
         begin
           fd.close
-          @logger.debug("Closed file #{path}", :fd => fd)
+          @logger.debug? &&  @logger.debug("Closed file #{path}", :fd => fd)
         rescue Exception => e
           @logger.error("Exception while flushing and closing files.", :exception => e)
         end
@@ -150,11 +151,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     fd.truncate(0)
     fd.seek(0, IO::SEEK_SET)
     fd.write(chunks.last)
+    fd.flush unless @flusher && @flusher.alive?
   end
 
   def behavior_append(path, chunks)
     fd = open(path)
     chunks.each { |chunk| fd.write(chunk) }
+    fd.flush unless @flusher && @flusher.alive?
   end
 
   def behavior_rotate(path, chunks)
@@ -180,7 +183,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
 
   def inside_file_root?(log_path)
     target_file = File.expand_path(log_path)
-    return target_file.start_with?("#{@file_root.to_s}/")
+    target_file.start_with?("#{@file_root.to_s}/")
   end
 
   def event_path(event)
@@ -188,10 +191,10 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     if path_with_field_ref? && !inside_file_root?(file_output_path)
       @logger.warn("File: the event tried to write outside the files root, writing the event to the failure file",  :event => event, :filename => @failure_path)
       file_output_path = @failure_path
-    elsif !@create_if_deleted && deleted?(file_output_path)
+    elsif !@create_if_deleted && !exist?(file_output_path)
       file_output_path = @failure_path
     end
-    @logger.debug("File, writing event to file.", :filename => file_output_path)
+    @logger.debug? &&  @logger.debug("File, writing event to file.", :filename => file_output_path)
 
     file_output_path
   end
@@ -201,10 +204,12 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   end
 
   def path_with_field_ref?
-    path =~ FIELD_REF
+    # we can memoize to optimize since path does not change
+    @is_path_with_field_ref ||= (path =~ FIELD_REF)
   end
 
   def extract_file_root
+    # this could also be memoized but is only called once in register
     parts = File.expand_path(path).split(File::SEPARATOR)
     parts.take_while { |part| part !~ FIELD_REF }.join(File::SEPARATOR)
   end
@@ -212,10 +217,10 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   # the back-bone of @flusher, our periodic-flushing interval.
   def flush_pending_files
     @io_mutex.synchronize do
-      @logger.debug("Starting flush cycle")
+      @logger.debug? && @logger.debug("Starting flush cycle")
 
       @files.each do |path, fd|
-        @logger.debug("Flushing file", :path => path, :fd => fd)
+        @logger.debug? &&  @logger.debug("Flushing file", :path => path, :fd => fd)
         fd.flush
       end
     end
@@ -233,13 +238,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   end
 
   def close_stale_files
-    @logger.debug("Starting stale files cleanup cycle", :files => @files)
+    @logger.debug? &&  @logger.debug("Starting stale files cleanup cycle", :files => @files)
     inactive_files = @files.select { |path, fd| not fd.active }
-    @logger.debug("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
-    puts("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
+    @logger.debug? &&  @logger.debug("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
+    # puts("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
     inactive_files.each do |path, fd|
       @logger.info("Closing file %s" % path)
-      puts("Closing file %s" % path)
+      # puts("Closing file %s" % path)
       if fd.class == Zlib::GzipWriter
         fd.close
         fd.to_io.close
@@ -256,20 +261,20 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     @files.include?(path) && !@files[path].nil?
   end
 
-  def deleted?(path)
-    !File.exist?(path)
+  def exit?(path)
+    File.exist?(path)
   end
 
   def open(path)
-    if !deleted?(path) && cached?(path)
-      puts("** not deleted and cached")
+    if exist?(path) && cached?(path)
+      # puts("** not deleted and cached")
       return @files[path]
     end
 
-    if deleted?(path)
-      puts("** is deleted #{path}")
+    if !exist?(path)
+      # puts("** is deleted #{path}")
       if @create_if_deleted
-        @logger.debug("Required path was deleted, creating the file again", :path => path)
+        @logger.debug? &&  @logger.debug("Required path was deleted, creating the file again", :path => path)
         @files.delete(path)
       else
         return @files[path] if cached?(path)
@@ -300,11 +305,65 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       end
     end
     if gzip
-      puts("** new gzip writer")
+      # puts("** new gzip writer")
       fd = Zlib::GzipWriter.new(fd)
     end
+
     @files[path] = IOWriter.new(fd)
   end
+
+  def temp_rotate_path(path)
+    path + @rotate_extension
+  end
+
+  def final_rotate_path(path, rotation_count)
+    path + ".#{rotation_count}"
+  end
+
+  def safe_rotate(path, rotation_count = 0)
+    i = rotation_count
+    # we assume there is only one file output plugin per file pattern so no race condition in the rotation generation
+    while File.exists?(final_rotate_path(path, i))
+      i += 1
+    end
+    FileUtils.mv(temp_rotate_path(path), final_rotate_path(path, i))
+  end
+
+  def rotate_open(path)
+    if cached?(path)
+      return @files[path]
+    end
+
+    if exist?(temp_rotate_path)
+      safe_rotate(path)
+    end
+
+    @logger.info("Opening file", :path => temp_rotate_path)
+
+    dir = File.dirname(path)
+    if !Dir.exist?(dir)
+      @logger.info("Creating directory", :directory => dir)
+      if @dir_mode != -1
+        FileUtils.mkdir_p(dir, :mode => @dir_mode)
+      else
+        FileUtils.mkdir_p(dir)
+      end
+    end
+
+    if @file_mode != -1
+      fd = File.new(temp_rotate_path, "w", @file_mode)
+    else
+      fd = File.new(temp_rotate_path, "w")
+    end
+
+    if gzip
+      # puts("** new gzip writer")
+      fd = Zlib::GzipWriter.new(fd)
+    end
+
+    @files[path] = IOWriter.new(fd)
+  end
+
 
   ##
   # Bare-bones utility for running a block of code at an interval.
@@ -402,7 +461,6 @@ class IOWriter
 
   def method_missing(method_name, *args, &block)
     if @io.respond_to?(method_name)
-
       @io.send(method_name, *args, &block)
     else
       super
