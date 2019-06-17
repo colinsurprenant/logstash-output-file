@@ -47,38 +47,86 @@ describe LogStash::Outputs::File do
     end # agent
   end
 
-  describe "ship lots of events to a file gzipped" do
-    Stud::Temporary.file('logstash-spec-output-file') do |tmp_file|
-      event_count = 100000 + rand(500)
+  class TestableFile < LogStash::Outputs::File
+    def initialize(*params)
+      super
+    end
 
-      config <<-CONFIG
-        input {
-          generator {
-            message => "hello world"
-            count => #{event_count}
-            type => "generator"
-          }
-        }
-        output {
-          file {
-            path => "#{tmp_file.path}"
-            gzip => true
-          }
-        }
-      CONFIG
+    def force_close
+      close_stale_files
+      close_stale_files
+    end
+  end
 
-      agent do
-        line_num = 0
-        # Now check all events for order and correctness.
-        events = Zlib::GzipReader.open(tmp_file.path).map {|line| LogStash::Event.new(LogStash::Json.load(line)) }
-        sorted = events.sort_by {|e| e.get("sequence")}
-        sorted.each do |event|
-          insist {event.get("message")} == "hello world"
-          insist {event.get("sequence")} == line_num
-          line_num += 1
-        end
-        insist {line_num} == event_count
-      end # agent
+  describe "gzip" do
+    context "zip file contains events" do
+      Stud::Temporary.file('logstash-spec-output-file') do |tmp_file|
+        event_count = 100000 + rand(500)
+
+        config <<-CONFIG
+          input {
+            generator {
+              message => "hello world"
+              count => #{event_count}
+              type => "generator"
+            }
+          }
+          output {
+            file {
+              path => "#{tmp_file.path}"
+              gzip => true
+            }
+          }
+        CONFIG
+
+        agent do
+          line_num = 0
+          # Now check all events for order and correctness.
+          events = Zlib::GzipReader.open(tmp_file.path).map {|line| LogStash::Event.new(LogStash::Json.load(line)) }
+          sorted = events.sort_by {|e| e.get("sequence")}
+          sorted.each do |event|
+            insist {event.get("message")} == "hello world"
+            insist {event.get("sequence")} == line_num
+            line_num += 1
+          end
+          insist {line_num} == event_count
+        end # agent
+      end
+    end
+
+
+    context "write events, close, write again" do
+      let(:tmp) { Stud::Temporary.pathname }
+      let(:output) { TestableFile.new({ "path" => tmp, "gzip" => true, "codec" => "json_lines"}) }
+      let(:events_count) { 100 }
+      let(:events1) { events_count.times.map {|i| LogStash::Event.new("value" => i) }}
+      let(:events2) { events_count.times.map {|i| LogStash::Event.new("value" => i + events_count) }}
+
+      before do
+        output.register
+      end
+
+      after do
+        output.close
+        # File.unlink(tmp) if File.exist?(tmp)
+      end
+
+      it "works" do
+        output.multi_receive(events1)
+        output.force_close
+        events = []
+        Zlib::GzipReader.open(tmp) {|gz| gz.each {|line| events << LogStash::Event.new(LogStash::Json.load(line)) }}
+        expect(events.size).to eq(events_count)
+        expect(events[0].get("value")).to eq(0)
+        expect(events[events_count - 1].get("value")).to eq(events_count - 1)
+
+        output.multi_receive(events2)
+        output.force_close
+        events = []
+        Zlib::GzipReader.open(tmp) {|gz| gz.each {|line| events << LogStash::Event.new(LogStash::Json.load(line)) }}
+        expect(events.size).to eq(events_count * 2)
+        expect(events[events_count].get("value")).to eq(events_count)
+      end
     end
   end
 

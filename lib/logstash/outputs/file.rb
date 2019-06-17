@@ -72,7 +72,13 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   #
   # If `overwrite`, the file will be truncated before writing and only the most
   # recent event will appear in the file.
-  config :write_behavior, :validate => [ "overwrite", "append" ], :default => "append"
+  config :write_behavior, :validate => [ "overwrite", "append", "rotate" ], :default => "append"
+
+
+  config :rotate_interval, :validate => :number, :default => 60 # minutes
+  config :rotate_size, :validate => :number, :default => 100 # mb
+  config :rotate_idle, :validate => :number, :default => 3600 # seconds
+
 
   default :codec, "json_lines"
 
@@ -100,6 +106,8 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
 
     @last_stale_cleanup_cycle = Time.now
     @stale_cleanup_interval = 10
+
+    self.class.send(:alias_method, :writer, "behavior_#{@write_behavior}")
   end
 
   def multi_receive_encoded(events_and_encoded)
@@ -111,20 +119,11 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
     end
 
     @io_mutex.synchronize do
-      encoded_by_path.each do |path,chunks|
-        fd = open(path)
-        if @write_behavior == "overwrite"
-          fd.truncate(0)
-          fd.seek(0, IO::SEEK_SET)
-          fd.write(chunks.last)
-        else
-          # append to the file
-          chunks.each {|chunk| fd.write(chunk) }
-        end
-        fd.flush unless @flusher && @flusher.alive?
+      encoded_by_path.each do |path, chunks|
+        writer(path, chunks)
       end
 
-      close_stale_files
+      periodic_close_stale_files
     end
   end
 
@@ -145,6 +144,22 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   end
 
   private
+
+  def behavior_overwrite(path, chunks)
+    fd = open(path)
+    fd.truncate(0)
+    fd.seek(0, IO::SEEK_SET)
+    fd.write(chunks.last)
+  end
+
+  def behavior_append(path, chunks)
+    fd = open(path)
+    chunks.each { |chunk| fd.write(chunk) }
+  end
+
+  def behavior_rotate(path, chunks)
+
+  end
 
   def validate_path
     if (root_directory =~ FIELD_REF) != nil
@@ -210,21 +225,31 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
   end
 
   # every 10 seconds or so (triggered by events, but if there are no events there's no point closing files anyway)
-  def close_stale_files
+  def periodic_close_stale_files
     now = Time.now
     return unless now - @last_stale_cleanup_cycle >= @stale_cleanup_interval
+    close_stale_files
+    @last_stale_cleanup_cycle = now
+  end
 
+  def close_stale_files
     @logger.debug("Starting stale files cleanup cycle", :files => @files)
     inactive_files = @files.select { |path, fd| not fd.active }
     @logger.debug("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
+    puts("%d stale files found" % inactive_files.count, :inactive_files => inactive_files)
     inactive_files.each do |path, fd|
       @logger.info("Closing file %s" % path)
-      fd.close
+      puts("Closing file %s" % path)
+      if fd.class == Zlib::GzipWriter
+        fd.close
+        fd.to_io.close
+      else
+        fd.close
+      end
       @files.delete(path)
     end
     # mark all files as inactive, a call to write will mark them as active again
     @files.each { |path, fd| fd.active = false }
-    @last_stale_cleanup_cycle = now
   end
 
   def cached?(path)
@@ -237,10 +262,12 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
 
   def open(path)
     if !deleted?(path) && cached?(path)
+      puts("** not deleted and cached")
       return @files[path]
     end
 
     if deleted?(path)
+      puts("** is deleted #{path}")
       if @create_if_deleted
         @logger.debug("Required path was deleted, creating the file again", :path => path)
         @files.delete(path)
@@ -273,6 +300,7 @@ class LogStash::Outputs::File < LogStash::Outputs::Base
       end
     end
     if gzip
+      puts("** new gzip writer")
       fd = Zlib::GzipWriter.new(fd)
     end
     @files[path] = IOWriter.new(fd)
